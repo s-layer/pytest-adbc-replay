@@ -26,6 +26,7 @@ on:
     workflows:
       - "PR"
       - "Claude Review"
+      - "Docs"
       - "Verify lockfile"
     types: [completed]
 
