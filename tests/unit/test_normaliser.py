@@ -55,14 +55,15 @@ class TestNormTwoFallback:
 
     def test_fallback_does_not_raise(self) -> None:
         """normalise_sql() never raises ParseError — always falls back."""
-        from pytest_adbc_replay._normaliser import normalise_sql
+        from pytest_adbc_replay._normaliser import NormalisationWarning, normalise_sql
 
-        with warnings.catch_warnings(record=True):
+        with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             # Must not raise
-            result = normalise_sql("ZZZZ @@@@@ NOT VALID SQL !!!!!")
-            assert isinstance(result, str)
-            assert len(result) > 0
+            result = normalise_sql("ZZZZ   @@@@@ NOT\n VALID SQL !!!!!")
+        # The fallback collapses whitespace only, and says so.
+        assert result == "ZZZZ @@@@@ NOT VALID SQL !!!!!"
+        assert [w.category for w in caught] == [NormalisationWarning]
 
     def test_fallback_emits_normalisation_warning(self) -> None:
         """When sqlglot fails, NormalisationWarning is emitted."""
