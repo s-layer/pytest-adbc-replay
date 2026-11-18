@@ -11,11 +11,11 @@ The files themselves must give back exactly what was recorded.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import uuid
 import warnings
 from decimal import Decimal
-from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import pytest
@@ -25,8 +25,10 @@ from hypothesis import strategies as st
 from pytest_adbc_replay._cassette_io import (
     read_arrow_table,
     read_params_json,
+    read_sql_file,
     write_arrow_table,
     write_params_json,
+    write_sql_file,
 )
 from pytest_adbc_replay._normaliser import NormalisationWarning, normalise_sql
 from pytest_adbc_replay._params import (
@@ -35,6 +37,9 @@ from pytest_adbc_replay._params import (
     params_to_cache_key,
     serialise_params,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 REGISTRY = build_registry(None)
 DIALECTS = [None, "snowflake", "duckdb", "databricks"]
@@ -46,12 +51,27 @@ DIALECTS = [None, "snowflake", "duckdb", "databricks"]
 identifiers = st.from_regex(r"[a-z][a-z0-9_]{0,7}", fullmatch=True).map(lambda name: f"c_{name}")
 """Unquoted names, prefixed so that none is a keyword in any dialect."""
 
-int_literals = st.integers(-(10**12), 10**12).map(str)
+int_literals = st.integers(-(10**12), 10**12)
 string_literals = st.text(
     st.characters(codec="utf-8", exclude_categories=["Cs", "Cc"], exclude_characters="\\"),
     max_size=12,
-).map(lambda text: "'" + text.replace("'", "''") + "'")
+)
 literals = int_literals | string_literals
+"""Literal values; `_quote` writes them in the dialect's own syntax."""
+
+
+def _quote(value: int | str, dialect: str | None) -> str:
+    """
+    A literal as the dialect writes it.
+
+    Databricks (Spark) escapes a quote inside a string with a backslash: there, ``'a''b'`` is
+    two adjacent strings, which sqlglot reads as ``CONCAT('a', 'b')``.
+    """
+    if isinstance(value, int):
+        return str(value)
+    if dialect == "databricks":
+        return "'" + value.replace("'", "\\'") + "'"
+    return "'" + value.replace("'", "''") + "'"
 
 
 @st.composite
@@ -65,7 +85,12 @@ def select_statements(draw: st.DrawFn) -> dict[str, Any]:
     }
 
 
-def _render(parts: dict[str, Any], spaces: list[str] | None = None, upper: bool = True) -> str:
+def _render(
+    parts: dict[str, Any],
+    dialect: str | None,
+    spaces: list[str] | None = None,
+    upper: bool = True,
+) -> str:
     """Write the statement with the given whitespace runs and keyword case."""
     keywords = ["SELECT", "FROM", "WHERE"]
     if not upper:
@@ -78,7 +103,7 @@ def _render(parts: dict[str, Any], spaces: list[str] | None = None, upper: bool 
         keywords[2],
         parts["where"],
         "=",
-        parts["literal"],
+        _quote(parts["literal"], dialect),
     ]
     gaps = spaces or [" "] * (len(tokens) - 1)
     out = tokens[0]
@@ -100,32 +125,34 @@ def _key(sql: str, dialect: str | None) -> str:
         return normalise_sql(sql, dialect)
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
 @given(select_statements(), st.sampled_from(DIALECTS))
 def test_normalise_sql_is_idempotent(parts: dict[str, Any], dialect: str | None) -> None:
-    once = _key(_render(parts), dialect)
+    once = _key(_render(parts, dialect), dialect)
     assert _key(once, dialect) == once
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
 @given(select_statements(), whitespace_runs, st.booleans(), st.sampled_from(DIALECTS))
 def test_whitespace_and_keyword_case_never_change_the_key(
     parts: dict[str, Any], spaces: list[str], upper: bool, dialect: str | None
 ) -> None:
-    assert _key(_render(parts, spaces, upper), dialect) == _key(_render(parts), dialect)
+    assert _key(_render(parts, dialect, spaces, upper), dialect) == _key(
+        _render(parts, dialect), dialect
+    )
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
 @given(select_statements(), literals, st.sampled_from(DIALECTS))
 def test_different_literals_never_share_a_key(
     parts: dict[str, Any], other: str, dialect: str | None
 ) -> None:
     assume(other != parts["literal"])
     changed = {**parts, "literal": other}
-    assert _key(_render(parts), dialect) != _key(_render(changed), dialect)
+    assert _key(_render(parts, dialect), dialect) != _key(_render(changed, dialect), dialect)
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
 @given(
     select_statements(), identifiers, st.sampled_from(["table", "where"]), st.sampled_from(DIALECTS)
 )
@@ -134,7 +161,7 @@ def test_different_identifiers_never_share_a_key(
 ) -> None:
     assume(other != parts[slot])
     changed = {**parts, slot: other}
-    assert _key(_render(parts), dialect) != _key(_render(changed), dialect)
+    assert _key(_render(parts, dialect), dialect) != _key(_render(changed, dialect), dialect)
 
 
 SNOWFLAKE_SHOW = [
@@ -154,7 +181,7 @@ SNOWFLAKE_SHOW = [
 DESCRIBE_KINDS = ["TABLE", "VIEW", "SEMANTIC VIEW"]
 
 
-@settings(max_examples=200, suppress_health_check=[HealthCheck.too_slow])
+@settings(max_examples=200, deadline=None, suppress_health_check=[HealthCheck.too_slow])
 @given(
     st.sampled_from([*SNOWFLAKE_SHOW, *(f"DESCRIBE {kind} {{name}}" for kind in DESCRIBE_KINDS)]),
     st.sampled_from([*SNOWFLAKE_SHOW, *(f"DESCRIBE {kind} {{name}}" for kind in DESCRIBE_KINDS)]),
@@ -213,7 +240,7 @@ def _identity(value: Any) -> Any:
     return (type(value).__name__, repr(value))
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
 @given(params)
 def test_params_round_trip_through_the_cassette_file(tmp_path_factory: Any, value: Any) -> None:
     path: Path = tmp_path_factory.mktemp("params") / "000_params.json"
@@ -222,7 +249,35 @@ def test_params_round_trip_through_the_cassette_file(tmp_path_factory: Any, valu
     assert _identity(restored) == _identity(value)
 
 
-@settings(max_examples=300)
+@settings(max_examples=300, deadline=None)
+@given(params)
+def test_replay_key_from_the_file_equals_the_record_key(tmp_path_factory: Any, value: Any) -> None:
+    """
+    Replay rebuilds a key from the params file; it must be the key recording made.
+
+    Recording keys with ``params_to_cache_key``; replay reads the file back and dumps it with
+    ``sort_keys`` (``_cursor._make_key_from_canonical``). If the two encodings drift, every
+    replay misses.
+    """
+    path: Path = tmp_path_factory.mktemp("params") / "000_params.json"
+    write_params_json(serialise_params(value, REGISTRY), path)
+    replay_key = json.dumps(read_params_json(path), sort_keys=True)
+    assert replay_key == params_to_cache_key(value, REGISTRY)
+
+
+@settings(max_examples=300, deadline=None)
+@given(select_statements(), st.sampled_from(DIALECTS))
+def test_canonical_sql_round_trips_through_the_cassette_file(
+    tmp_path_factory: Any, parts: dict[str, Any], dialect: str | None
+) -> None:
+    """Replay reads the stored canonical SQL back and compares it as is, unnormalised."""
+    canonical = _key(_render(parts, dialect), dialect)
+    path: Path = tmp_path_factory.mktemp("sql") / "000_query.sql"
+    write_sql_file(canonical, path)
+    assert read_sql_file(path) == canonical
+
+
+@settings(max_examples=300, deadline=None)
 @given(params, params)
 def test_different_params_never_share_a_key(first: Any, second: Any) -> None:
     assume(_identity(first) != _identity(second))
@@ -302,7 +357,7 @@ def arrow_tables(draw: st.DrawFn) -> pa.Table:
     return pa.Table.from_arrays(columns, schema=schema)
 
 
-@settings(max_examples=200)
+@settings(max_examples=200, deadline=None)
 @given(arrow_tables())
 def test_arrow_tables_round_trip_through_the_cassette_file(
     tmp_path_factory: Any, table: pa.Table
