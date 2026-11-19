@@ -97,4 +97,4 @@ already happened, named under "Source".
   finding.
   Source: the GitHub Actions lockfile section in AGENTS.md; a branch ref
   (`dtolnay/rust-toolchain@stable`) broke every job's setup in arrowmodel when the branch
-  was force-pushed, and Dependabot only bumps tags.
+  was force-pushed, and Dependabot never moves a branch ref.
