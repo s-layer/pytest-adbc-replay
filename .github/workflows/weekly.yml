@@ -17,7 +17,10 @@ jobs:
   compat:
     name: Latest deps compatibility
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Quality, unit tests and the integration run (dbc install, MySQL container)
+    # together: _test.yml gives those 15 + 20 minutes in two jobs. A job-level
+    # timeout skips the failure-PR steps, so leave headroom.
+    timeout-minutes: 35
     env:
       HAS_APP: ${{ secrets.BOT_APP_PRIVATE_KEY != '' }}
 
