@@ -43,10 +43,32 @@ jobs:
         continue-on-error: true
         run: prek run --all-files
 
+      # The same split as _test.yml: unit tests here, integration tests (which need
+      # Docker, the dbc CLI and its MySQL driver) in the steps below.
       - name: Tests
         id: tests
         continue-on-error: true
-        run: uv run pytest
+        run: uv run pytest tests/unit/
+
+      - name: Sync latest integration dependencies
+        id: integration-sync
+        continue-on-error: true
+        run: uv sync --upgrade --group dev --group integration
+
+      - name: Install dbc CLI and MySQL Foundry driver
+        id: dbc
+        if: steps.integration-sync.outcome == 'success'
+        continue-on-error: true
+        run: |
+          curl -LsSf https://dbc.columnar.tech/install.sh | sh
+          dbc --version
+          dbc install mysql
+
+      - name: Integration tests
+        id: integration
+        if: steps.dbc.outcome == 'success'
+        continue-on-error: true
+        run: uv run pytest tests/integration/ -v
 
       - name: Cache pruning
         if: always()
@@ -54,14 +76,14 @@ jobs:
 
       - name: Get app token
         id: app-token
-        if: (steps.quality.outcome == 'failure' || steps.tests.outcome == 'failure') && env.HAS_APP == 'true'
+        if: (steps.quality.outcome == 'failure' || steps.tests.outcome == 'failure' || steps.integration-sync.outcome == 'failure' || steps.dbc.outcome == 'failure' || steps.integration.outcome == 'failure') && env.HAS_APP == 'true'
         uses: actions/create-github-app-token@v3.3.0
         with:
           app-id: ${{ secrets.BOT_APP_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
 
       - name: Open PR for @copilot to fix
-        if: steps.quality.outcome == 'failure' || steps.tests.outcome == 'failure'
+        if: steps.quality.outcome == 'failure' || steps.tests.outcome == 'failure' || steps.integration-sync.outcome == 'failure' || steps.dbc.outcome == 'failure' || steps.integration.outcome == 'failure'
         env:
           GITHUB_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
